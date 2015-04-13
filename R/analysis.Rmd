@@ -1,0 +1,326 @@
+---
+title: "Erythroid analysis of intron retention"
+output:
+  html_document:
+    toc: true
+---
+
+# Introduction
+
+This is a [knitr](http://yihui.name/knitr/) analysis for the paper:
+
+- "An Erythroid Intron Retention Program Regulates Gene Expression During
+  Terminal Erythropoiesis" by Harold Pimentel, Marilyn Parra, Sherry Gee, Narla
+  Mohandas, Lior Pachter, John Conboy.
+
+# Preliminaries
+
+Let's first load the intron required packages
+
+```{r}
+library("data.table")
+library("reshape2")
+library("tidyr")
+library("dplyr")
+library("RColorBrewer")
+library("kma")
+```
+
+Next, let's load the eXpress results from the annotation made by
+[KeepMeAround](https://github.com/pachterlab/kma):
+
+```{r,cache=TRUE}
+xprs_fnames <- Sys.glob('../data/xprs/ec-*/*/xprs_refGene_01.06.2015/results.xprs')
+
+exp_names <- sub('../data/xprs/ec-jl-/','', xprs_fnames) %>%
+    sub('xprs_refGene_01.06.2015/results.xprs','', .) %>%
+    gsub('/', '', .) %>%
+    sub('^[.a-z]+ec-jl-','', .) %>%
+    gsub('proe', 'pro', .)
+
+conds <- sub("[0-9]+", "", exp_names)
+```
+
+- `xprs_fnames` points to the eXpress output files
+- `exp_names` contains the experiment names
+- `conds` points to the experimental conditions
+
+We can now read the data in using `kma` utilities:
+
+```{r,cache=TRUE}
+xprs <- read_express(xprs_fnames, exp_names, conds)
+```
+
+Let's read in the intron to transcript table from `kma`:
+
+```{r,cache=TRUE}
+i2t <- read.table('../data/kma/i2t_25_final.txt', header = TRUE,
+  stringsAsFactors = FALSE)
+# this next line is unnecessary in newer versions of 'kma'
+i2t <- dplyr::rename(i2t, "target_id" = transcript)
+```
+
+
+# Intron retention object
+
+Create an intron retention object:
+
+```{r,cache=TRUE}
+ir <- newIntronRetention(xprs$tpm, i2t, xprs$condition, xprs$uniq_counts)
+```
+
+The total number of introns:
+
+```{r,cache=TRUE}
+nrow(ir$retention)
+```
+
+Filter analysis:
+
+```{r,cache=TRUE}
+ir <- ir %>%
+    filter_low_tpm(1) %>%
+    filter_perfect_psi(digits = 6) %>%
+    filter_low_frags(3)
+```
+
+## Zero coverage
+
+Find the files and get metadata for them (sample namess and conditions)
+
+```{r,cache=TRUE}
+zc_file_names <- Sys.glob("../data/zero_coverage/ec-jl-*/*/zero_coverage_01.06.2015.txt")
+zc_sample_names <- sub('../data/zero_coverage/ec-jl-', '', zc_file_names) %>%
+    sub("/zero_coverage_01.06.2015.txt", "", .) %>%
+    sub("/", "", .) %>%
+    sub("proe", "pro", .)
+zc_exp_names <- sub("[0-9]+", "", zc_sample_names)
+```
+
+Load the data using `kma`. This might take a few seconds:
+
+```{r,cache=TRUE}
+all_zc <- get_batch_intron_zc(zc_file_names, zc_sample_names,
+    zc_exp_names)
+```
+
+Now, put it in intro the `IntronRetention` object:
+
+```{r,cache=TRUE}
+ir <- summarize_zero_coverage(ir, all_zc)
+```
+
+# Hypothesis testing
+
+First, compute the test.
+
+```{r,cache=TRUE}
+set.seed(42)
+ret_test <- retention_test(ir)
+```
+
+Do some reordering to get things appearing nicely on plots:
+
+```{r,cache=TRUE}
+ret_test <- ret_test %>%
+    mutate(condition = factor(condition, c("pro", "ebaso", "lbaso", "poly", "ortho"))) %>%
+    arrange(intron, condition)
+```
+
+Munge things a little bit to get nice tables
+
+```{r,cache=TRUE}
+ir$flat <- ir$flat %>%
+    mutate(condition = factor(condition, c("pro", "ebaso", "lbaso", "poly", "ortho"))) %>%
+    arrange(dplyr::desc(intron), condition)
+
+flat_w_pval <- data.table(ir$flat) %>%
+    left_join(data.table(ret_test), by = c("intron", "condition")) %>%
+    arrange(dplyr::desc(intron), condition)
+flat_w_pval <- flat_w_pval %>%
+    add_gene_names(ir)
+ret_test_gene <- add_gene_names(ret_test, ir)
+
+```
+
+Normally, the `ret_test` only returns things that pass filters in that
+particular condition. We are going to munge things a bit to get IR values for
+_everything_, but put a `NA` in the `pvalue` column:
+
+```{r,cache=TRUE}
+flat_up <- flat_w_pval %>%
+    group_by(intron, condition) %>%
+    mutate(mean_retention = replace(mean_retention,
+            is.na(mean_retention), mean(retention)),
+        var_retention = replace(var_retention,
+            is.na(var_retention), var(retention)))
+```
+
+`flat_up` contains information for _everything_ (including filters). We can
+summarize things a bit:
+
+```{r,cache=TRUE}
+flat_no_filt <- as.data.frame(flat_up, stringsAsFactors = FALSE) %>% select(intron, condition, mean_retention,
+    var_retention, pvalue, qvalue, gene, intron_extension, -starts_with("f_")) %>%
+    distinct() %>%
+    arrange(intron_extension, condition)
+```
+
+`flat_no_filt` is now the table reported in the supplement `flat_summarize.csv`
+
+# Clustering
+
+## Preparing the data
+
+First, we need to get the data intro a matrix that the `R` clustering tools
+like:
+
+```{r,cache=TRUE}
+s_ret_test <- ret_test %>%
+  select(intron, condition, mean_retention) %>%
+  spread(condition, mean_retention)
+s_ret_test <- s_ret_test[complete.cases(s_ret_test),]
+```
+
+The previous chunk gets the mean retention of the intron and extracts only
+introns that pass all filters in all conditions. Let's munge some more to get
+an actual matrix
+
+```{r,cache=TRUE}
+s_all_filt <- as.data.frame(s_ret_test)
+rownames(s_all_filt) <- s_ret_test$intron
+s_all_filt$intron <- NULL
+s_all_filt <- as.matrix(s_all_filt)
+head(s_all_filt)
+```
+
+## Performing the clustering
+
+```{r,cache=TRUE}
+set.seed(42)
+s_all_filt_km <- kmeans(s_all_filt, centers = 9, iter.max = 1000, nstart = 100)
+```
+
+## Visualization
+
+Let's put the clustering results into a form `ggplot` likes:
+
+```{r,cache=TRUE}
+melt_clust <- function(data, clust) {
+  stopifnot(is(clust, "kmeans"))
+  stopifnot(is(data, "matrix"))
+
+  m_data <- melt(data, varnames = c("intron", "condition"),
+    value.name = "mean_retention")
+  clust_names <- data.frame(intron = names(clust$cluster),
+    cluster = clust$cluster)
+  m_data <- left_join(data.table(m_data), data.table(clust_names), by = "intron")
+
+  clust_sizes <- data.frame(cluster = 1:length(clust$size), size = clust$size)
+  clust_data <- left_join(data.table(m_data), data.table(clust_sizes),
+    by = "cluster")
+
+  clust_data
+}
+```
+
+```{r,cache=TRUE}
+m_km <- melt_clust(s_all_filt, s_all_filt_km)
+# append the gene names
+i2g <- i2t %>%
+    select(intron, gene) %>%
+    distinct()
+m_km <- left_join(m_km, data.table(i2g), by = c("intron"))
+```
+
+The stuff below is simply to make the plot pretty and in the ordering we want:
+
+```{r,cache=TRUE}
+size_order <- as.character(c(124, 346, 33,
+        116, 178, 426,
+        1002, 2484, 5443))
+size_order_cname <- paste0(paste0("C", 1:length(size_order), " ("), size_order, ")")
+size_mapping <- data.frame(size_reorder = size_order, size_name = size_order_cname,
+  stringsAsFactors = FALSE)
+m_km <- m_km %>%
+  mutate(size_reorder = factor(as.character(size), levels = size_order))
+m_km <- data.table(m_km) %>%
+  mutate(size_reorder = as.character(size_reorder)) %>%
+  inner_join(data.table(size_mapping), by = c("size_reorder")) %>%
+  as.data.frame(stringsAsFactors = FALSE)
+m_km <- m_km %>%
+  mutate(size_name = factor(as.character(size_name), levels = size_order_cname))
+m_mean_km <- m_km %>%
+  group_by(condition, cluster, size_name) %>%
+  summarise(condition_mean = mean(mean_retention)) %>%
+  mutate(intron = NA)
+get_palette <- colorRampPalette(brewer.pal(5, "Set2"))
+colour_count <- length(unique(m_km$intron))
+```
+
+This is the clustering figure that appears in the paper:
+
+```{r,cache=TRUE,fig.width=12,fig.height=8}
+ggplot(m_km,
+    aes(condition, mean_retention, group = intron, colour = intron)) +
+    geom_point(alpha = 0.4) +
+    geom_line(alpha = 0.4) +
+    theme_bw(20) +
+    theme(legend.position = "none") +
+    xlab("Erythroblast stage") +
+    ylab("Retention") +
+    ylim(0, 1) +
+    scale_colour_manual(values = get_palette(colour_count)) +
+    geom_point(mapping = aes(condition, condition_mean),
+        data = m_mean_km,
+        colour = "black", alpha = 0.8, shape = 15, size = 2.5) +
+    geom_line(mapping = aes(condition, condition_mean),
+        data = m_mean_km,
+        colour = "black", alpha = 0.6, size = 1.25, linetype = "longdash") +
+    facet_wrap( ~ size_name) +
+    scale_x_discrete(labels = c("proE", "ebasoE", "lbasoE", "polyE", "orthoE")) +
+    theme(axis.text.x = element_text(angle = 30))
+```
+
+# Distribution of retention
+
+Compute the ECDF per condition based on the mean retention
+
+```{r,cache=TRUE}
+ret_dist <- ret_test %>%
+  group_by(condition) %>%
+  do({
+    ret <- data.frame(retention_level = seq(0, 1, length.out = 1000)) %>%
+    mutate(cdf = ecdf(.$mean_retention)(retention_level),
+      count = ceiling(cdf * nrow(.)),
+      inv_cdf = 1 - cdf,
+      inv_count = nrow(.) - count)
+    ret
+  })
+```
+
+Load a color blind palette
+```{r,cache=TRUE}
+cbbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2",
+  "#D55E00", "#CC79A7", "#000000")
+```
+Make the plot that appears in the supplement:
+
+```{r,fig.width=12,fig.height=8}
+ggplot(ret_dist, aes(retention_level, inv_cdf, group = condition,
+    colour = condition)) +
+    geom_line(aes(linetype = condition), size = 1.10) +
+    scale_color_manual(values = cbbPalette) +
+    scale_linetype_manual(
+      values = c("solid", "longdash", "dotdash", "solid", "solid")) +
+    theme_bw(20) +
+    ylab("Proportion of introns with at least X retention") +
+    xlab("Intron retention") +
+    xlim(0, 0.50)
+```
+
+# Session info
+
+```{r,cache=TRUE}
+sessionInfo()
+```
